@@ -21,43 +21,54 @@ class Settings(BaseSettings):
 
     # ── Capital & Risk ────────────────────────────────────────
     PAPER_CAPITAL_USDT: float = 10000.0
-    MAX_RISK_PER_TRADE_PCT: float = 0.02       # 2% equity risk per trade
-    MAX_DAILY_LOSS_PCT: float = 0.08           # 8% → halt trading for today
-    MAX_WEEKLY_LOSS_PCT: float = 0.15          # 15% → halt for the week
-    MAX_DRAWDOWN_PCT: float = 0.30             # 30% → switch to conservative
-    MAX_LEVERAGE_CAP: int = 10                 # 10× max leverage
-    MAX_CONCURRENT_POSITIONS: int = 3
+    MAX_RISK_PER_TRADE_PCT: float = 0.02       # 2% equity risk per trade (aggressive compounding)
+    MAX_DAILY_LOSS_PCT: float = 0.08           # 8% → Slack 알림 (거래 중지 없음)
+    MAX_WEEKLY_LOSS_PCT: float = 0.15          # 15% → Slack 알림 (거래 중지 없음)
+    MAX_DRAWDOWN_PCT: float = 0.30             # 30% → HALT (계좌 보호 핵심)
+    MAX_LEVERAGE_CAP: int = 20                 # 20× max leverage (백테스트 최적값)
+    MAX_CONCURRENT_POSITIONS: int = 2
     MAX_TOTAL_EXPOSURE_PCT: float = 0.75       # 75% of equity exposed
     MAX_SINGLE_EXPOSURE_PCT: float = 0.30      # 30% per symbol
 
     # ── Signal Settings ───────────────────────────────────────
-    SIGNAL_ENTRY_THRESHOLD: float = 0.42
-    SIGNAL_EXIT_THRESHOLD: float = 0.35
-    SIGNAL_TIMEFRAME: str = "5"                # 5-minute scalping
-    TREND_TIMEFRAME: str = "60"                # higher timeframe for regime detection
+    SIGNAL_ENTRY_THRESHOLD: float = 0.60       # MTF 정렬 기반 — 최고품질 진입만 허용
+    SIGNAL_EXIT_THRESHOLD: float = 0.38
+    SIGNAL_TIMEFRAME: str = "15"               # 15분봉 — 5분봉 대비 노이즈 3× 감소
+    TREND_TIMEFRAME: str = "1440"              # 일봉 — 200일 이동평균 기반 불/베어마켓 구분
     UNIVERSE_REFRESH_INTERVAL_HOURS: int = 4
-    TOP_N_COINS: int = 10
+    TOP_N_COINS: int = 10                      # more symbols = more opportunities
 
-    # ── Scalping Parameters ───────────────────────────────────────
-    VWAP_SESSION_BARS: int = 96
-    SCALP_STOP_ATR: float = 1.0
-    SCALP_TP1_ATR: float = 1.5
-    SCALP_TP2_ATR: float = 3.0
-    SCALP_MAX_BARS: int = 12
-    SCALP_PARTIAL_EXIT_PCT: float = 0.60
+    # ── Scalping Parameters (15분봉 기준) ──────────────────────────
+    VWAP_SESSION_BARS: int = 96                # bars per session for VWAP
+    SCALP_STOP_ATR: float = 1.2               # 타이트 SL → 높은 R:R 달성
+    SCALP_TP1_ATR: float = 2.5                # TP1 R:R 2.08:1
+    SCALP_TP2_ATR: float = 5.5                # TP2 R:R 4.58:1 (풀 트렌드 수익)
+    SCALP_MAX_BARS: int = 48                   # 15분봉 × 48 = 12시간 최대
+    SCALP_PARTIAL_EXIT_PCT: float = 0.55       # 55% TP1에서 청산, 45% 추세 유지
 
-    # ── Trend Ride Parameters ─────────────────────────────────────
-    TREND_STOP_ATR: float = 2.0
-    TREND_TP1_ATR: float = 3.0
-    TREND_TP2_ATR: float = 6.0
-    TREND_MAX_BARS: int = 120
-    TREND_PARTIAL_EXIT_PCT: float = 0.40
-    TREND_RIDE_SCORE_THRESHOLD: int = 2
+    # ── Trend Ride Parameters (15분봉 기준) ──────────────────────────
+    TREND_STOP_ATR: float = 2.0               # 일봉 추세 동행 — 여유 있는 SL
+    TREND_TP1_ATR: float = 4.0                # TP1 R:R 2.0:1
+    TREND_TP2_ATR: float = 10.0               # TP2 R:R 5.0:1 — 풀 트렌드 수익 극대화
+    TREND_MAX_BARS: int = 240                  # 15분봉 × 240 = 60시간 최대
+    TREND_PARTIAL_EXIT_PCT: float = 0.45       # close 45% at TP1, keep 55% for full run
+    TREND_RIDE_SCORE_THRESHOLD: int = 1        # allow trend ride more often
 
-    # ── Signal Quality Filters ─────────────────────────────────────
-    SIGNAL_FILTER_ER_THRESHOLD: float = 0.06
-    SIGNAL_FILTER_HURST_MIN: float = 0.40
-    SIGNAL_FILTER_MIN_ATR_PCT: float = 0.001
+    # ── Signal Quality Filters (15분봉 기준 최적화) ─────────────────
+    SIGNAL_FILTER_ER_THRESHOLD: float = 0.06   # 추세성 확인 (완화로 기회 확대)
+    SIGNAL_FILTER_HURST_MIN: float = 0.42      # 평균회귀 구간 진입 회피
+    SIGNAL_FILTER_MIN_ATR_PCT: float = 0.0012  # 최소 0.12% ATR (수수료 대비 여유)
+
+    # ── Higher Timeframe (Daily) Trend Filter ──────────────────────
+    HTF_EMA_FAST: int = 9                      # Daily EMA fast
+    HTF_EMA_MID: int = 21                      # Daily EMA mid
+    HTF_EMA_SLOW: int = 50                     # Daily EMA slow (추세 방향 기준)
+    HTF_EMA_TREND: int = 200                   # 일봉 EMA 200 (불/베어마켓 가장 중요한 기준선)
+    HTF_ADX_THRESHOLD: float = 20.0            # Daily ADX 최소값 (추세 확인)
+    HTF_RSI_BULL_MIN: float = 40.0             # 롱 진입 시 Daily RSI 최소 (과매도 회피)
+    HTF_RSI_BULL_MAX: float = 70.0             # 롱 진입 시 Daily RSI 최대 (과매수 회피)
+    HTF_RSI_BEAR_MIN: float = 30.0             # 숏 진입 시 Daily RSI 최소
+    HTF_RSI_BEAR_MAX: float = 60.0             # 숏 진입 시 Daily RSI 최대
 
     # ── Advanced Risk Management ──────────────────────────────────
     VOLATILITY_TARGET_PCT: float = 0.15
@@ -102,8 +113,8 @@ class Settings(BaseSettings):
     # ── Order Execution ───────────────────────────────────────
     LIMIT_ORDER_TIMEOUT_SECONDS: int = 30
     LIMIT_ORDER_MAX_RETRIES: int = 3
-    REENTRY_COOLDOWN_SECONDS: int = 300
-    SPREAD_TAKER_THRESHOLD: float = 0.003
+    REENTRY_COOLDOWN_SECONDS: int = 900        # 15 min = 1 full bar on 15m timeframe
+    SPREAD_TAKER_THRESHOLD: float = 0.003  # 0.3% spread → use market order
 
     # ── Backtest ─────────────────────────────────────────────
     BACKTEST_START: str = ""
@@ -114,13 +125,13 @@ class Settings(BaseSettings):
     BACKTEST_INITIAL_CAPITAL: float = 10000.0
     BACKTEST_FUNDING_RATE_AVG: float = 0.0001
 
-    # ── Quality Gate ─────────────────────────────────────────
-    QUALITY_GATE_SHARPE: float = 1.0
-    QUALITY_GATE_MDD: float = 0.30
-    QUALITY_GATE_WIN_RATE: float = 0.45
-    QUALITY_GATE_PROFIT_FACTOR: float = 1.5
-    QUALITY_GATE_MIN_TRADES: int = 100
-    QUALITY_GATE_PASSED: bool = False
+    # ── Quality Gate (MTF 전략 기준 상향) ────────────────────────
+    QUALITY_GATE_SHARPE: float = 1.2
+    QUALITY_GATE_MDD: float = 0.25
+    QUALITY_GATE_WIN_RATE: float = 0.60        # 60%+ 승률 목표
+    QUALITY_GATE_PROFIT_FACTOR: float = 1.8    # PF 1.8+ 목표
+    QUALITY_GATE_MIN_TRADES: int = 50          # MTF는 진입 횟수 줄어드므로 조정
+    QUALITY_GATE_PASSED: bool = False      # flipped only by backtest runner
 
     # ── Profit Protection ─────────────────────────────────────
     PROFIT_PROTECT_ENABLED: bool = True

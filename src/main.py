@@ -172,6 +172,7 @@ class TradingBot:
             vwap=snap.vwap,
             vwap_distance_pct=snap.vwap_distance_pct,
             orderbook_imbalance=snap.orderbook.imbalance,
+            htf_df=snap.trend_ohlcv,
         )
         combined = self._combiner.combine(sig_bundle, regime_r)
 
@@ -199,9 +200,8 @@ class TradingBot:
             today_kst = datetime.now(tz=_KST).date().isoformat()
             if self._daily_loss_alert_sent_date != today_kst:
                 self._daily_loss_alert_sent_date = today_kst
-                self._slack.send_risk_alert(
-                    f"⚠️ {guard.reason}\n복리 모드: 거래를 계속 진행합니다."
-                )
+                loss_pct = abs(daily_pnl) / max(equity, 1) * 100
+                self._slack.send_daily_loss_limit(loss_pct)
 
         pos = self._state_machine.get_position(symbol)
 
@@ -404,16 +404,7 @@ class TradingBot:
                 "Partial TP1 exit %s | closed=%.4f gross_pnl=%.4f fee=%.4f net_pnl=%.4f stop→breakeven",
                 symbol, qty_to_close, pnl, total_fee, pnl_net,
             )
-
-            side_str = "Buy" if direction == 1 else "Sell"
-            pnl_pct = pnl_net / (pos.entry_price * qty_to_close) if pos.entry_price > 0 and qty_to_close > 0 else 0.0
-            self._slack.send_position_closed(
-                symbol=symbol,
-                side=side_str,
-                reason="PARTIAL_TP1",
-                pnl=pnl_net,
-                pnl_pct=pnl_pct,
-            )
+            # PARTIAL_TP1은 Slack 알림 없음 (노이즈 감소 — /dashboard로 확인)
 
     def _execute_exit(self, symbol, pos, current_price, reason, snap) -> None:
         sym_info = self._client.get_symbol_info(symbol)
@@ -724,22 +715,13 @@ def main():
         coalesce=True,
     )
 
-    # Briefing: 09:00 KST 시작, 4시간 간격
+    # Briefing: 09:00 KST + 21:00 KST (하루 2회만 — 노이즈 감소)
     scheduler.add_job(
         bot._briefing.send,
-        CronTrigger(hour="9,13,17,21,1,5", minute=0, timezone="Asia/Seoul"),
-        id="periodic_briefing",
+        CronTrigger(hour="9,21", minute=0, timezone="Asia/Seoul"),
+        id="daily_briefing",
     )
-
-    if settings.SLACK_DASHBOARD_INTERVAL_MINUTES > 0:
-        scheduler.add_job(
-            bot.send_dashboard,
-            "interval",
-            minutes=settings.SLACK_DASHBOARD_INTERVAL_MINUTES,
-            id="dashboard",
-            max_instances=1,
-            coalesce=True,
-        )
+    # 자동 dashboard 스케줄러: 제거 (노이즈 감소 — /dashboard 슬래시 커맨드로 수동 확인)
 
     scheduler.start()
     log.info("Scheduler started. Running first cycle immediately...")
@@ -754,11 +736,6 @@ def main():
         bot.run_cycle()
     except Exception as e:
         log.exception("First cycle failed: %s", e)
-
-    try:
-        bot.send_dashboard()
-    except Exception as e:
-        log.exception("Initial dashboard failed: %s", e)
 
     def _shutdown(signum, frame):
         log.info("Shutdown signal received")

@@ -175,7 +175,7 @@ class ProfitProtector:
             return True
 
         try:
-            self._client.transfer_to_funding(amount)
+            self._client.transfer_to_spot(amount)  # Binance: Futures → Spot Account
             return True
         except Exception as e:
             log.error("ProfitProtector: transfer failed: %s", e)
