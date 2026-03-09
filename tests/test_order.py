@@ -339,3 +339,84 @@ class TestStateMachine:
         assert pos.tp1_price == 0.0
         assert pos.tp2_price == 0.0
         assert pos.tp1_hit is False
+
+
+class TestOrderManagerCancelCleanup:
+    """진입/청산 전 cancel_all_orders() 호출 검증 (주문 누적 방지)."""
+
+    def _make_order_manager(self, cancel_return=0):
+        from unittest.mock import MagicMock, patch
+        from src.execution.order_manager import OrderManager
+
+        settings = make_settings(
+            SPREAD_TAKER_THRESHOLD=0.003,
+            SIGNAL_URGENT_THRESHOLD=0.90,
+            BINANCE_HEDGE_MODE=True,
+            LIMIT_ORDER_TIMEOUT_SECONDS=1,
+            LIMIT_ORDER_MAX_RETRIES=1,
+        )
+        client = MagicMock()
+        client.round_qty.return_value = "0.010"
+        client.round_price.return_value = "50000.00"
+        # cancel_all_orders: 0건 취소됨
+        client.cancel_all_orders.return_value = cancel_return
+        # 시장가 주문 성공 응답
+        client.place_order.return_value = {
+            "orderId": "123456",
+            "clientOrderId": "test-id",
+            "status": "FILLED",
+            "avgPrice": "50000.0",
+            "executedQty": "0.010",
+        }
+        slack = MagicMock()
+        return OrderManager(client, settings, slack), client
+
+    def test_open_position_calls_cancel_all_before_entry(self):
+        """진입 전 cancel_all_orders(symbol, side=side) 가 호출돼야 함."""
+        from src.risk.engine import RiskParameters
+
+        om, client = self._make_order_manager()
+        risk = RiskParameters(
+            leverage=5, position_size_usdt=500, margin_usdt=100,
+            qty_base=0.01, stop_price=49000, take_profit_price=52000,
+            tp1_price=51000, tp2_price=52000, trailing_stop_atr=500,
+            max_loss_usdt=10, risk_ok=True,
+        )
+        # 시장가 진입 (spread > threshold)
+        om.open_position(
+            symbol="BTCUSDT", direction=1, risk_params=risk,
+            spread_pct=0.005,  # > SPREAD_TAKER_THRESHOLD → market order
+            signal_strength=0.7, current_price=50000.0,
+            symbol_info={"min_qty": 0.001, "qty_step": 0.001, "price_step": 0.1,
+                         "min_notional": 5.0, "max_leverage": 125,
+                         "qty_precision": 3, "price_precision": 1},
+        )
+        # cancel_all_orders가 진입 전 호출됐는지 확인
+        client.cancel_all_orders.assert_called_once_with("BTCUSDT", side="BUY")
+
+    def test_close_position_calls_cancel_all_before_exit(self):
+        """청산 전 cancel_all_orders(symbol, side=side) 가 호출돼야 함."""
+        om, client = self._make_order_manager()
+        om.close_position(
+            symbol="BTCUSDT", direction=1,  # long position → close side = SELL
+            qty=0.01, current_price=50000.0,
+            symbol_info={"min_qty": 0.001, "qty_step": 0.001, "price_step": 0.1,
+                         "min_notional": 5.0, "max_leverage": 125,
+                         "qty_precision": 3, "price_precision": 1},
+            reason="STOP_LOSS",
+        )
+        # 롱 청산 시 side=SELL로 cancel_all_orders 호출
+        client.cancel_all_orders.assert_called_once_with("BTCUSDT", side="SELL")
+
+    def test_close_short_calls_cancel_buy_side(self):
+        """숏 청산 전 BUY 쪽 주문 정리."""
+        om, client = self._make_order_manager()
+        om.close_position(
+            symbol="ETHUSDT", direction=-1,  # short → close side = BUY
+            qty=0.1, current_price=1900.0,
+            symbol_info={"min_qty": 0.001, "qty_step": 0.001, "price_step": 0.01,
+                         "min_notional": 5.0, "max_leverage": 100,
+                         "qty_precision": 3, "price_precision": 2},
+            reason="TAKE_PROFIT",
+        )
+        client.cancel_all_orders.assert_called_once_with("ETHUSDT", side="BUY")

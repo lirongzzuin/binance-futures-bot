@@ -75,7 +75,7 @@ class RiskEngine:
         trade_mode: Optional[str] = None,  # "SCALP" or "TREND_RIDE"
         recent_close: Optional[pd.Series] = None,  # for AQR vol-targeting
         win_stats: Optional[dict] = None,           # for quarter-Kelly cap
-        bear_mode: bool = False,            # True = BEAR/SIDEWAYS macro regime
+        bear_mode: bool = False,  # True = BEAR/SIDEWAYS → BEAR_MAX_LEVERAGE_CAP 사용
     ) -> RiskParameters:
 
         # ── Basic feasibility checks ─────────────────────────────────────────
@@ -96,6 +96,12 @@ class RiskEngine:
             tp2_atr_mult = self._s.TREND_TP2_ATR
             partial_exit_pct = self._s.TREND_PARTIAL_EXIT_PCT
             mode_max_bars = self._s.TREND_MAX_BARS
+        elif resolved_mode == "PURE_SCALP":
+            stop_atr_mult = self._s.SCALP_PURE_STOP_ATR
+            tp1_atr_mult = self._s.SCALP_PURE_TP1_ATR
+            tp2_atr_mult = self._s.SCALP_PURE_TP2_ATR
+            partial_exit_pct = self._s.SCALP_PURE_PARTIAL_EXIT_PCT
+            mode_max_bars = self._s.SCALP_PURE_MAX_BARS
         else:
             stop_atr_mult = self._s.SCALP_STOP_ATR
             tp1_atr_mult = self._s.SCALP_TP1_ATR
@@ -103,26 +109,67 @@ class RiskEngine:
             partial_exit_pct = self._s.SCALP_PARTIAL_EXIT_PCT
             mode_max_bars = self._s.SCALP_MAX_BARS
 
-        # ── Step 1: Stop distance ────────────────────────────────────────────
-        stop_distance = atr * stop_atr_mult
+        # ── Signal-driven risk escalation ─────────────────────────────────────
+        # 드로우다운이 높을수록 에스컬레이션 자동 억제 (안전 장치)
+        dd_escalation_allowed = drawdown_pct <= 0.15
+
+        target_risk = self._s.MAX_RISK_PER_TRADE_PCT
+        if signal_strength >= 0.85 and dd_escalation_allowed:
+            stop_atr_scale = 0.68
+            trade_risk_pct = min(0.12, target_risk * 6.0)
+        elif signal_strength >= 0.80 and dd_escalation_allowed:
+            stop_atr_scale = 0.73
+            trade_risk_pct = min(0.10, target_risk * 5.0)
+        elif signal_strength >= 0.75 and dd_escalation_allowed:
+            stop_atr_scale = 0.80
+            trade_risk_pct = min(0.07, target_risk * 3.5)
+        elif signal_strength >= 0.65:
+            stop_atr_scale = 0.88
+            trade_risk_pct = min(0.05, target_risk * 2.5)
+        else:
+            stop_atr_scale = 1.00
+            trade_risk_pct = min(0.03, target_risk * 1.5)
+
+        # ── Step 1: Stop distance (signal-scaled + vol-adjusted + minimum floor) ──
+        # 변동성 적응형 스탑: ATR이 작을수록 배수 확대 (노이즈 대비)
+        atr_pct = atr / entry_price if entry_price > 0 else 0.01
+        if atr_pct < 0.003:
+            vol_stop_mult = 2.0
+        elif atr_pct < 0.006:
+            vol_stop_mult = 1.5
+        elif atr_pct < 0.012:
+            vol_stop_mult = 1.0
+        else:
+            vol_stop_mult = 0.85
+
+        stop_distance = atr * stop_atr_mult * stop_atr_scale * vol_stop_mult
+        # 수수료 체크용 원본 TP1 저장 (vol 스케일 미적용)
+        raw_tp1_atr_mult = tp1_atr_mult
+        # TP도 동일한 vol_stop_mult 적용 → R:R 비율 유지
+        tp1_atr_mult *= vol_stop_mult
+        tp2_atr_mult *= vol_stop_mult
+
+        # 모드별 최소 스탑 거리 플로어
+        _min_stop_pct_map = {
+            "PURE_SCALP": self._s.MIN_STOP_PCT_PURE_SCALP,
+            "SCALP":      self._s.MIN_STOP_PCT_SCALP,
+            "TREND_RIDE": self._s.MIN_STOP_PCT_TREND_RIDE,
+        }
+        min_stop_pct = _min_stop_pct_map.get(resolved_mode, self._s.MIN_STOP_PCT_SCALP)
+        min_stop_dist = entry_price * min_stop_pct
+        if stop_distance < min_stop_dist:
+            tp_scale = min_stop_dist / stop_distance
+            stop_distance = min_stop_dist
+        else:
+            tp_scale = 1.0
+
         stop_distance_pct = stop_distance / entry_price
 
         if stop_distance_pct <= 0:
             return self._no_trade("Stop distance zero")
 
-        # ── Step 2: Base leverage from volatility targeting ───────────────────
-        # Target: equity × risk_pct = loss if stop is hit
-        # qty = equity × risk_pct / stop_distance
-        # notional = qty × price
-        # leverage = notional / margin = qty × price / (qty × price / leverage) → solve:
-        # leverage = notional / (equity × risk_pct / stop_distance_pct)
-        # → leverage = 1 / stop_distance_pct × (we scale later)
-        #
-        # Simpler: base_leverage = target_risk_pct / stop_distance_pct
-        # This ensures 1 stop-hit = target_risk_pct of equity lost (at 1× leverage)
-        # Then position_size = equity × risk_pct / (price × stop_distance_pct)
-        target_risk = self._s.MAX_RISK_PER_TRADE_PCT
-        base_leverage = target_risk / stop_distance_pct
+        # ── Step 2: Base leverage ─────────────────────────────────────────────
+        base_leverage = trade_risk_pct / stop_distance_pct
         base_leverage = max(1.0, base_leverage)
 
         # ── Step 3: Dampening factors ─────────────────────────────────────────
@@ -156,8 +203,8 @@ class RiskEngine:
         else:
             fund_mod = 1.00
 
-        # (d) Signal strength
-        sig_mod = 0.50 + 0.50 * signal_strength  # 0.55 → 0.775, 1.0 → 1.0
+        # (d) Signal quality gate
+        sig_mod = 0.65 + 0.35 * min(signal_strength, 1.0)
 
         # (e) Account health (drawdown + consecutive losses)
         dd_mod = max(0.25, 1.0 - drawdown_pct * 3.0)
@@ -171,12 +218,11 @@ class RiskEngine:
         risk_engine_cap = self._s.BEAR_MAX_LEVERAGE_CAP if bear_mode else self._s.MAX_LEVERAGE_CAP
         exchange_cap = min(symbol_max_leverage, 100)
 
-        # Additional safety: if drawdown > 15%, cap at 5×
-        if drawdown_pct > 0.15:
-            risk_engine_cap = min(risk_engine_cap, 5)
-        # If drawdown > 10%, cap at 10×
-        elif drawdown_pct > 0.10:
-            risk_engine_cap = min(risk_engine_cap, 10)
+        # Additional safety: 드로우다운 비례 캡
+        if drawdown_pct > 0.20:
+            risk_engine_cap = min(risk_engine_cap, max(5, risk_engine_cap // 4))
+        elif drawdown_pct > 0.12:
+            risk_engine_cap = min(risk_engine_cap, max(10, risk_engine_cap // 2))
 
         final_leverage = max(1, min(
             math.floor(raw_leverage),
@@ -185,13 +231,9 @@ class RiskEngine:
         ))
 
         # ── Step 5: Position sizing ───────────────────────────────────────────
-        # We want: loss if stop hit = equity × risk_pct
-        # qty × stop_distance = equity × risk_pct
-        # qty = equity × risk_pct / stop_distance (in base units)
-        qty_base = equity * target_risk / stop_distance
+        qty_base = equity * trade_risk_pct / stop_distance
 
         # ── AQR Volatility Targeting (Moreira & Muir 2017) ────────────────────
-        # Scale position so daily P&L vol ≈ VOLATILITY_TARGET_PCT / sqrt(252)
         vol_target_qty: float = 0.0
         if recent_close is not None and len(recent_close) >= 20:
             log_rets = np.log(recent_close / recent_close.shift(1)).dropna()
@@ -199,14 +241,14 @@ class RiskEngine:
                 daily_vol = float(log_rets.rolling(20).std().iloc[-1])
                 if not pd.isna(daily_vol) and daily_vol > 0:
                     daily_target = self._s.VOLATILITY_TARGET_PCT / math.sqrt(252)
-                    # qty × price × daily_vol ≈ equity × daily_target
                     vol_target_qty = equity * daily_target / (entry_price * daily_vol)
                     if vol_target_qty > 0:
                         qty_base = min(qty_base, vol_target_qty)
 
-        # ── Quarter-Kelly position size cap (Van K. Tharp) ───────────────────
+        # ── Adaptive Half-Kelly position sizing ────────────────────────────────
         kelly_qty: float = 0.0
-        if win_stats is not None and win_stats.get("n_trades", 0) >= 30:
+        kelly_min_trades = self._s.KELLY_MIN_TRADES
+        if win_stats is not None and win_stats.get("n_trades", 0) >= kelly_min_trades:
             wr = float(win_stats.get("win_rate", 0.5))
             avg_win = float(win_stats.get("avg_win", 1.0))
             avg_loss = float(win_stats.get("avg_loss", 1.0))
@@ -214,11 +256,16 @@ class RiskEngine:
                 r_ratio = avg_win / avg_loss
                 kelly_f = wr - (1.0 - wr) / r_ratio
                 kelly_f = max(0.0, kelly_f)
-                # Quarter-Kelly risk amount, converted to qty via stop distance
-                quarter_kelly_risk = equity * kelly_f * self._s.USE_KELLY_FRACTION
-                kelly_qty = quarter_kelly_risk / stop_distance
+                effective_kelly = kelly_f * self._s.USE_KELLY_FRACTION * signal_strength
+                kelly_risk = equity * min(effective_kelly, 0.10)
+                kelly_qty = kelly_risk / stop_distance
                 if kelly_qty > 0:
                     qty_base = min(qty_base, kelly_qty)
+                    log.debug(
+                        "Kelly sizing | wr=%.2f r_ratio=%.2f kelly_f=%.3f "
+                        "effective=%.3f risk=%.2f qty=%.4f",
+                        wr, r_ratio, kelly_f, effective_kelly, kelly_risk, kelly_qty,
+                    )
 
         # Clamp to total exposure limit
         max_notional_per_trade = equity * self._s.MAX_SINGLE_EXPOSURE_PCT * final_leverage
@@ -228,17 +275,17 @@ class RiskEngine:
             notional = max_notional_per_trade
 
         margin = notional / final_leverage
-        max_loss = qty_base * stop_distance  # = equity × risk_pct (by design)
+        max_loss = qty_base * stop_distance
 
         # ── Step 6: Stop / TP prices ──────────────────────────────────────────
         if side == "Buy":
             stop_price = entry_price - stop_distance
-            tp1_price = entry_price + atr * tp1_atr_mult
-            tp_price = entry_price + atr * tp2_atr_mult   # TP2 = full close target
+            tp1_price = entry_price + atr * tp1_atr_mult * tp_scale
+            tp_price = entry_price + atr * tp2_atr_mult * tp_scale
         else:
             stop_price = entry_price + stop_distance
-            tp1_price = entry_price - atr * tp1_atr_mult
-            tp_price = entry_price - atr * tp2_atr_mult
+            tp1_price = entry_price - atr * tp1_atr_mult * tp_scale
+            tp_price = entry_price - atr * tp2_atr_mult * tp_scale
 
         # ── Step 7: Minimum notional check ────────────────────────────────────
         min_notional = symbol_info.get("min_notional", 5.0)
@@ -248,23 +295,33 @@ class RiskEngine:
             )
 
         # ── Step 7b: 수수료 손익분기점 체크 ──────────────────────────────────
-        # TP1 도달 시 예상 수익이 수수료(진입 + 청산)의 1.5배 이상이어야 진입
-        # round-trip: 진입 MAKER(0.020%) + TP1 청산 MAKER(0.020%) + 슬리피지×2
-        round_trip_fee_pct = (
-            self._s.BACKTEST_FEE_MAKER * 2 + self._s.BACKTEST_SLIPPAGE_PCT * 2
+        entry_is_market = (
+            spread_pct > self._s.SPREAD_TAKER_THRESHOLD
+            or signal_strength > self._s.SIGNAL_URGENT_THRESHOLD
         )
-        tp1_move_pct = (atr * tp1_atr_mult) / entry_price
-        fee_safety_multiplier = 2.0  # TP1 수익이 수수료의 최소 2.0배
-        # SCALP: ATR=0.107% → TP1=0.160% > fee×2.0=0.160% ✓ (최소 기준)
-        # TREND: ATR=0.053% → TP1=0.160% > fee×2.0=0.160% ✓
+        entry_fee_rate = (
+            self._s.BACKTEST_FEE_TAKER if entry_is_market else self._s.BACKTEST_FEE_MAKER
+        )
+        round_trip_fee_pct = (
+            entry_fee_rate + self._s.BACKTEST_FEE_MAKER + self._s.BACKTEST_SLIPPAGE_PCT * 2
+        )
+        tp1_move_pct = (atr * raw_tp1_atr_mult) / entry_price
+
+        # 모드별 수수료 안전 배수
+        if resolved_mode == "PURE_SCALP":
+            fee_safety_multiplier = 1.5
+        else:
+            fee_safety_multiplier = 2.0
+
         if tp1_move_pct < round_trip_fee_pct * fee_safety_multiplier:
+            entry_type = "Taker(시장가)" if entry_is_market else "Maker(PostOnly)"
             return self._no_trade(
                 f"TP1 예상수익 {tp1_move_pct:.4%} < 수수료×{fee_safety_multiplier:.1f} "
-                f"{round_trip_fee_pct * fee_safety_multiplier:.4%} — 수수료 손익분기 미달"
+                f"{round_trip_fee_pct * fee_safety_multiplier:.4%} "
+                f"[진입={entry_type}, 모드={resolved_mode}] — 수수료 손익분기 미달"
             )
 
         # ── Step 8: Liquidation distance check ────────────────────────────────
-        # Require liquidation price to be at least 3× the stop distance away.
         # Binance USDT-perpetual maintenance margin rate ≈ 0.5% for most symbols.
         maintenance_margin_rate = 0.005
         if side == "Buy":

@@ -116,6 +116,75 @@ class DataCollector:
 
         return snap
 
+    def collect_for_scalp(self, symbol: str, limit: int = 500) -> MarketSnapshot:
+        """
+        스캘핑 전략용 데이터 수집.
+        - LTF (3m): 진입 신호용
+        - HTF (15m): 추세 바이어스용
+        """
+        snap = MarketSnapshot(symbol=symbol)
+
+        # LTF (3m) OHLCV — 진입 신호
+        try:
+            ltf_interval = _INTERVAL_MAP.get(self._settings.SCALP_PURE_LTF_TIMEFRAME, "3m")
+            raw_ltf = self._client.get_kline(symbol, interval=ltf_interval, limit=limit)
+            if raw_ltf:
+                snap.ohlcv = self._raw_to_df(raw_ltf)
+        except Exception as e:
+            log.error("Scalp LTF OHLCV fetch failed for %s: %s", symbol, e)
+            return snap
+
+        # HTF (15m) OHLCV — 추세 바이어스
+        try:
+            htf_interval = _INTERVAL_MAP.get(self._settings.SCALP_PURE_HTF_TIMEFRAME, "15m")
+            raw_htf = self._client.get_kline(symbol, interval=htf_interval, limit=300)
+            if raw_htf:
+                snap.trend_ohlcv = self._raw_to_df(raw_htf)
+        except Exception as e:
+            log.warning("Scalp HTF OHLCV fetch failed for %s: %s", symbol, e)
+
+        # 오더북
+        try:
+            snap.orderbook = self._fetch_orderbook(symbol)
+        except Exception as e:
+            log.warning("Scalp orderbook fetch failed for %s: %s", symbol, e)
+
+        # 펀딩 비율
+        try:
+            funding = self._client.get_funding_rate_history(symbol, limit=5)
+            if funding:
+                snap.funding_rate = float(funding[-1].get("fundingRate", 0))
+                snap.next_funding_ts = int(funding[-1].get("fundingTime", 0))
+        except Exception as e:
+            log.warning("Scalp funding fetch failed for %s: %s", symbol, e)
+
+        # OI (5m 기준)
+        try:
+            oi_records = self._client.get_open_interest(symbol, period="5m", limit=5)
+            if len(oi_records) >= 2:
+                snap.open_interest = float(oi_records[-1].get("sumOpenInterest", 0))
+                snap.oi_prev = float(oi_records[-2].get("sumOpenInterest", 0))
+                if snap.oi_prev > 0:
+                    snap.oi_change_pct = (snap.open_interest - snap.oi_prev) / snap.oi_prev
+            elif len(oi_records) == 1:
+                snap.open_interest = float(oi_records[0].get("sumOpenInterest", 0))
+        except Exception as e:
+            log.warning("Scalp OI fetch failed for %s: %s", symbol, e)
+
+        # 현재가 및 VWAP (HTF 기준 — 세션 VWAP)
+        if not snap.ohlcv.empty:
+            snap.last_price = float(snap.ohlcv["close"].iloc[-1])
+
+        if snap.trend_ohlcv is not None and not snap.trend_ohlcv.empty:
+            snap.vwap = self._compute_vwap(snap.trend_ohlcv, self._settings.VWAP_SESSION_BARS)
+        elif not snap.ohlcv.empty:
+            snap.vwap = self._compute_vwap(snap.ohlcv, self._settings.VWAP_SESSION_BARS)
+
+        if snap.vwap > 0 and snap.last_price > 0:
+            snap.vwap_distance_pct = (snap.last_price - snap.vwap) / snap.vwap
+
+        return snap
+
     def _fetch_ohlcv(self, symbol: str, limit: int) -> pd.DataFrame:
         interval = _INTERVAL_MAP.get(self._settings.SIGNAL_TIMEFRAME, "5m")
         raw = self._client.get_kline(symbol, interval=interval, limit=limit)
@@ -167,7 +236,7 @@ class DataCollector:
         return float(val) if not (val != val) else 0.0
 
     def _fetch_orderbook(self, symbol: str) -> OrderBookSnapshot:
-        book = self._client.get_orderbook(symbol, limit=25)
+        book = self._client.get_orderbook(symbol, limit=20)
         bids = book.get("bids", [])
         asks = book.get("asks", [])
 

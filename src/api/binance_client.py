@@ -188,27 +188,40 @@ class BinanceClient:
             params["endTime"] = end
         return self._call("futures_klines", **params)
 
-    def get_orderbook(self, symbol: str, limit: int = 25) -> Dict:
-        """Order book snapshot. Returns dict with 'bids' and 'asks' lists."""
+    def get_orderbook(self, symbol: str, limit: int = 20) -> Dict:
+        """Order book snapshot. Returns dict with 'bids' and 'asks' lists.
+        Valid Binance depth limits: 5, 10, 20, 50, 100, 500, 1000.
+        """
         return self._call("futures_order_book", symbol=symbol, limit=limit)
 
     def get_funding_rate_history(self, symbol: str, limit: int = 10) -> List[Dict]:
-        """Historical funding rates. Returns list with 'fundingRate', 'fundingTime'."""
-        return self._call("futures_funding_rate", symbol=symbol, limit=limit)
+        """Historical funding rates. Returns list with 'fundingRate', 'fundingTime'.
+        Testnet does not support this endpoint — returns [] on failure without
+        tripping the circuit breaker (non-critical optional data).
+        """
+        try:
+            fn = getattr(self._client, "futures_funding_rate")
+            result = fn(symbol=symbol, limit=limit)
+            self._circuit.record_success()
+            return result
+        except Exception:
+            return []
 
     def get_open_interest(self, symbol: str, period: str = "5m", limit: int = 10) -> List[Dict]:
-        """Open interest history. Returns list with 'sumOpenInterest', 'timestamp'."""
+        """Open interest history. Returns list with 'sumOpenInterest', 'timestamp'.
+        Testnet does not support openInterestHist — returns [] without tripping
+        the circuit breaker (non-critical optional data).
+        """
         try:
-            return self._call(
-                "futures_open_interest_hist",
-                symbol=symbol,
-                period=period,
-                limit=limit,
-            )
+            fn = getattr(self._client, "futures_open_interest_hist")
+            result = fn(symbol=symbol, period=period, limit=limit)
+            self._circuit.record_success()
+            return result
         except Exception:
-            # Fallback to current OI only
+            # Fallback: current OI snapshot (supported on testnet)
             try:
-                current = self._call("futures_open_interest", symbol=symbol)
+                fn2 = getattr(self._client, "futures_open_interest")
+                current = fn2(symbol=symbol)
                 return [current] if current else []
             except Exception:
                 return []
@@ -316,7 +329,7 @@ class BinanceClient:
             mode_name = "Hedge" if hedge_mode else "One-Way"
             log.info("Position mode set to %s", mode_name)
         except BinanceClientError as e:
-            if e.code == -4046:
+            if e.code in (-4046, -4059):
                 log.debug("Position mode already set correctly")
             else:
                 raise
@@ -435,7 +448,7 @@ class BinanceClient:
         take_profit: Optional[str] = None,
         position_side: str = "BOTH",
         sl_order_type: str = "STOP_MARKET",      # SL: Market (urgent)
-        tp_order_type: str = "TAKE_PROFIT",       # TP: Limit (Maker fee)
+        tp_order_type: str = "TAKE_PROFIT_MARKET",  # TP: Market (closePosition=true 지원)
         tp_limit_price: Optional[str] = None,
     ) -> Dict:
         """
@@ -508,6 +521,29 @@ class BinanceClient:
         except Exception as e:
             log.warning("Failed to cancel all orders for %s: %s", symbol, e)
             return {}
+
+    def cancel_all_orders(self, symbol: str, side: Optional[str] = None) -> int:
+        """심볼의 모든 미체결 지정가 주문을 취소. side 필터 지원 (None이면 전체).
+        Returns: 취소된 주문 수.
+        """
+        open_orders = self.get_open_orders(symbol)
+        cancelled = 0
+        for order in open_orders:
+            if side:
+                order_side = order.get("side", "").upper()
+                if order_side != side.upper():
+                    continue
+            order_id = str(order.get("orderId", ""))
+            if not order_id:
+                continue
+            try:
+                self.cancel_order(symbol, order_id)
+                cancelled += 1
+            except Exception as e:
+                log.warning("cancel_all_orders: failed to cancel %s for %s: %s", order_id, symbol, e)
+        if cancelled:
+            log.info("Cancelled %d stale order(s) for %s (side=%s)", cancelled, symbol, side or "all")
+        return cancelled
 
     # ── Asset Transfers ───────────────────────────────────────────────────────
 

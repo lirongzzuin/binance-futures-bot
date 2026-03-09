@@ -8,7 +8,15 @@ import json
 import sqlite3
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
+
+_KST = timezone(timedelta(hours=9))
+
+
+def _today_kst() -> str:
+    """Return today's date in KST (Korea Standard Time) as ISO string."""
+    return datetime.now(tz=_KST).date().isoformat()
 
 from src.config import Settings
 from src.logger import get_logger
@@ -120,8 +128,7 @@ class Database:
         self._update_daily_stats(pnl)
 
     def _update_daily_stats(self, pnl: float) -> None:
-        from datetime import date
-        today = date.today().isoformat()
+        today = _today_kst()
         with self._conn() as conn:
             conn.execute(
                 """INSERT INTO daily_stats(date, pnl, trades, wins, losses)
@@ -200,8 +207,7 @@ class Database:
             return [dict(r) for r in rows]
 
     def get_today_pnl(self) -> float:
-        from datetime import date
-        today = date.today().isoformat()
+        today = _today_kst()
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT pnl FROM daily_stats WHERE date=?", (today,)
@@ -234,16 +240,44 @@ class Database:
             row = conn.execute(sql, params).fetchone()
             return float(row[0] or 0)
 
-    def get_trades_count_today(self) -> int:
-        from datetime import date
-        today_start = __import__("time").mktime(
-            date.today().timetuple()
-        )
+    def get_trades_count_today(self, symbol: Optional[str] = None) -> int:
+        today_kst = datetime.now(tz=_KST).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start = today_kst.timestamp()
         with self._conn() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM trades WHERE exit_ts >= ?", (today_start,)
-            ).fetchone()
+            if symbol:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM trades WHERE entry_ts >= ? AND symbol=?",
+                    (today_start, symbol),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM trades WHERE entry_ts >= ?", (today_start,)
+                ).fetchone()
             return int(row[0] or 0)
+
+    def get_rolling_win_stats(self, window: int = 50) -> Optional[Dict]:
+        """최근 N개 거래의 승률/평균수익/평균손실 — Kelly 산출용."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT pnl FROM trades WHERE exit_ts IS NOT NULL "
+                "ORDER BY exit_ts DESC LIMIT ?",
+                (window,),
+            ).fetchall()
+            if len(rows) < 10:
+                return None
+            pnls = [float(r[0]) for r in rows]
+            wins = [p for p in pnls if p > 0]
+            losses = [abs(p) for p in pnls if p < 0]
+            n = len(pnls)
+            wr = len(wins) / n if n > 0 else 0.5
+            avg_win = sum(wins) / len(wins) if wins else 0.0
+            avg_loss = sum(losses) / len(losses) if losses else 0.0
+            return {
+                "n_trades": n,
+                "win_rate": wr,
+                "avg_win": avg_win,
+                "avg_loss": avg_loss,
+            }
 
     def get_win_rate(self, days: int = 30) -> float:
         """Win rate of closed trades over the last N days."""

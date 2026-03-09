@@ -62,6 +62,8 @@ class PositionInfo:
     lowest_price: float = 0.0    # for short trailing stop
     entry_ts: float = 0.0
     last_exit_ts: float = 0.0    # for cooldown
+    last_exit_was_loss: bool = False   # 직전 청산이 손절이었는지
+    last_exit_direction: int = 0       # 직전 포지션 방향 (+1 long, -1 short)
     consecutive_losses: int = 0
     unrealised_pnl: float = 0.0
     order_id: Optional[str] = None
@@ -108,16 +110,33 @@ class StateMachine:
 
     # ── Entry ────────────────────────────────────────────────────────────────
 
-    def can_enter(self, symbol: str) -> bool:
-        """Check cooldown and basic entry feasibility."""
+    def can_enter(self, symbol: str, direction: int = 0) -> bool:
+        """
+        Check cooldown and basic entry feasibility.
+
+        Direction-aware cooldown (손절 후):
+          - 동일 방향 재진입: REENTRY_SAME_DIR_COOLDOWN_SECONDS (45분)
+          - 반대 방향 진입: REENTRY_COOLDOWN_SECONDS (30분)
+          - 수익 청산 후: 기본 쿨다운 (30분)
+        """
         pos = self.get_position(symbol)
         if not pos.is_flat:
             return False
-        cooldown = self._s.REENTRY_COOLDOWN_SECONDS
-        if pos.last_exit_ts > 0 and time.time() - pos.last_exit_ts < cooldown:
-            remaining = cooldown - (time.time() - pos.last_exit_ts)
-            log.debug("Cooldown active for %s — %.0fs remaining", symbol, remaining)
-            return False
+
+        if pos.last_exit_ts > 0:
+            elapsed = time.time() - pos.last_exit_ts
+            # 손절 후 동일 방향: 더 긴 쿨다운 (같은 실수 반복 방지)
+            if (pos.last_exit_was_loss
+                    and direction != 0
+                    and direction == pos.last_exit_direction):
+                cooldown = self._s.REENTRY_SAME_DIR_COOLDOWN_SECONDS
+            else:
+                cooldown = self._s.REENTRY_COOLDOWN_SECONDS
+
+            if elapsed < cooldown:
+                remaining = cooldown - elapsed
+                log.debug("Cooldown active for %s — %.0fs remaining", symbol, remaining)
+                return False
         return True
 
     def enter(
@@ -375,6 +394,8 @@ class StateMachine:
         )
 
         pos.last_exit_ts = time.time()
+        pos.last_exit_was_loss = (pnl < 0)
+        pos.last_exit_direction = 1 if pos.is_long else -1
         pos.state = PositionState.FLAT
         pos.entry_price = 0.0
         pos.qty = 0.0

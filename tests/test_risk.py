@@ -204,6 +204,95 @@ class TestRiskEngine:
         result = self._calc(atr=500, entry_price=50000)
         assert result.risk_ok
 
+    def test_wide_spread_uses_taker_fee_in_breakeven(self):
+        """스프레드 > SPREAD_TAKER_THRESHOLD → Taker 수수료로 손익분기점 계산."""
+        s = make_settings(
+            SPREAD_TAKER_THRESHOLD=0.003,
+            SIGNAL_URGENT_THRESHOLD=0.90,
+            BACKTEST_FEE_MAKER=0.0002,
+            BACKTEST_FEE_TAKER=0.0004,
+            BACKTEST_SLIPPAGE_PCT=0.0002,
+        )
+        engine = RiskEngine(s)
+        # 스프레드 넓음 → 시장가 진입 → Taker 수수료 0.04%
+        # round_trip = 0.04%+0.02%+0.04% = 0.10% → min_tp1 = 0.20%
+        # ATR=4, SCALP_TP1=1.5 → tp1_move = 1.5*4/50000 = 0.012% → 거부
+        result = engine.calculate(
+            equity=10000.0, entry_price=50000.0, side="Buy", atr=4.0,
+            signal_strength=0.7, spread_pct=0.005, funding_rate=0.0,
+            vol_percentile=0.3, drawdown_pct=0.0, consecutive_losses=0,
+            symbol_max_leverage=125, symbol_info=SYMBOL_INFO, current_positions=0,
+        )
+        assert not result.risk_ok
+        assert "Taker" in result.reason
+
+    def test_urgent_signal_uses_taker_fee_in_breakeven(self):
+        """신호 강도 > SIGNAL_URGENT_THRESHOLD → Taker 수수료로 계산."""
+        s = make_settings(
+            SPREAD_TAKER_THRESHOLD=0.003,
+            SIGNAL_URGENT_THRESHOLD=0.90,
+            BACKTEST_FEE_MAKER=0.0002,
+            BACKTEST_FEE_TAKER=0.0004,
+            BACKTEST_SLIPPAGE_PCT=0.0002,
+        )
+        engine = RiskEngine(s)
+        result = engine.calculate(
+            equity=10000.0, entry_price=50000.0, side="Buy", atr=4.0,
+            signal_strength=0.95, spread_pct=0.001, funding_rate=0.0,
+            vol_percentile=0.3, drawdown_pct=0.0, consecutive_losses=0,
+            symbol_max_leverage=125, symbol_info=SYMBOL_INFO, current_positions=0,
+        )
+        assert not result.risk_ok
+        assert "Taker" in result.reason
+
+    def test_normal_spread_uses_maker_fee_in_breakeven(self):
+        """정상 스프레드 + 낮은 신호 → PostOnly(Maker) 수수료로 계산."""
+        s = make_settings(
+            SPREAD_TAKER_THRESHOLD=0.003,
+            SIGNAL_URGENT_THRESHOLD=0.90,
+            BACKTEST_FEE_MAKER=0.0002,
+            BACKTEST_FEE_TAKER=0.0004,
+            BACKTEST_SLIPPAGE_PCT=0.0002,
+        )
+        engine = RiskEngine(s)
+        # Maker: round_trip = 0.02%+0.02%+0.04% = 0.08% → min_tp1 = 0.16%
+        # ATR=60: tp1 = 1.5*60/50000 = 0.18% > 0.16% → 통과
+        result = engine.calculate(
+            equity=10000.0, entry_price=50000.0, side="Buy", atr=60.0,
+            signal_strength=0.70, spread_pct=0.001, funding_rate=0.0,
+            vol_percentile=0.3, drawdown_pct=0.0, consecutive_losses=0,
+            symbol_max_leverage=125, symbol_info=SYMBOL_INFO, current_positions=0,
+        )
+        assert result.risk_ok
+
+    def test_maker_vs_taker_breakeven_difference(self):
+        """Maker 기준은 통과하지만 Taker 기준은 거부되는 경계 케이스."""
+        s = make_settings(
+            SPREAD_TAKER_THRESHOLD=0.003,
+            SIGNAL_URGENT_THRESHOLD=0.90,
+            BACKTEST_FEE_MAKER=0.0002,
+            BACKTEST_FEE_TAKER=0.0004,
+            BACKTEST_SLIPPAGE_PCT=0.0002,
+        )
+        engine = RiskEngine(s)
+        # ATR=60: tp1_move = 1.5*60/50000 = 0.18%
+        # Maker min_tp1 = 0.16% → 통과
+        # Taker min_tp1 = 0.20% → 거부
+        maker_result = engine.calculate(
+            equity=10000.0, entry_price=50000.0, side="Buy", atr=60.0,
+            signal_strength=0.70, spread_pct=0.001, funding_rate=0.0,
+            vol_percentile=0.3, drawdown_pct=0.0, consecutive_losses=0,
+            symbol_max_leverage=125, symbol_info=SYMBOL_INFO, current_positions=0,
+        )
+        taker_result = engine.calculate(
+            equity=10000.0, entry_price=50000.0, side="Buy", atr=60.0,
+            signal_strength=0.95, spread_pct=0.001, funding_rate=0.0,
+            vol_percentile=0.3, drawdown_pct=0.0, consecutive_losses=0,
+            symbol_max_leverage=125, symbol_info=SYMBOL_INFO, current_positions=0,
+        )
+        assert maker_result.risk_ok, "Maker 경로는 통과해야 함"
+        assert not taker_result.risk_ok, "Taker 경로는 거부돼야 함"
+
     # ── Volatility Targeting (AQR) ────────────────────────────────────────────
 
     def test_vol_targeting_with_recent_close(self):
@@ -399,8 +488,19 @@ class TestRiskGuards:
         result = self._check(equity=8400, weekly_pnl=-1600)  # ~16% weekly
         assert result.action == GuardAction.ALLOW
 
-    def test_max_drawdown_halt(self):
+    def test_max_drawdown_heavy_reduce(self):
+        # 31% DD → heavy REDUCE (30~42% zone)
         result = self._check(equity=6900, peak_equity=10000)  # 31% DD
+        assert result.action == GuardAction.REDUCE
+
+    def test_max_drawdown_pause(self):
+        # 43% DD → PAUSE (42~50% zone)
+        result = self._check(equity=5700, peak_equity=10000)  # 43% DD
+        assert result.action == GuardAction.PAUSE
+
+    def test_max_drawdown_halt(self):
+        # 51% DD → HALT (>= 50%)
+        result = self._check(equity=4900, peak_equity=10000)  # 51% DD
         assert result.action == GuardAction.HALT
 
     def test_moderate_drawdown_reduce(self):

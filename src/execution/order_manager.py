@@ -12,6 +12,10 @@ Idempotency:
   - Each trade intent generates a deterministic client_order_id
   - Duplicate detection prevents double-sends on restart
 
+Stale Order Management:
+  - cancel_stale_orders(symbol): 포지션 청산 후 잔여 SL/TP 주문 취소
+  - audit_stale_orders(active_symbols): 주기적으로 미체결 주문 스캔 및 정리
+
 Binance Futures specifics:
   - Hedge mode: positionSide = "LONG" | "SHORT"
   - PostOnly: timeInForce = "GTX" (Good Till Crossing)
@@ -58,6 +62,8 @@ class ManagedOrder:
     attempts: int = 0
     created_ts: float = field(default_factory=time.time)
     position_side: str = "BOTH"   # "LONG" | "SHORT" | "BOTH"
+    sl_order_id: Optional[str] = None  # 거래소 SL 주문 ID (취소 추적용)
+    tp_order_id: Optional[str] = None  # 거래소 TP 주문 ID (취소 추적용)
 
 
 class OrderManager:
@@ -114,10 +120,16 @@ class OrderManager:
         else:
             position_side = "BOTH"
 
+        # ── 진입 전 미체결 주문 정리 (주문 누적 방지) ─────────────────────────
+        try:
+            self._client.cancel_all_orders(symbol, side=side)
+        except Exception as e:
+            log.warning("pre-entry cancel_all_orders failed for %s %s: %s", symbol, side, e)
+
         # ── Choose order type ──────────────────────────────────────────────────
         use_market = (
             spread_pct > self._s.SPREAD_TAKER_THRESHOLD or
-            signal_strength > 0.90
+            signal_strength > self._s.SIGNAL_URGENT_THRESHOLD
         )
 
         managed = ManagedOrder(
@@ -180,6 +192,12 @@ class OrderManager:
         else:
             position_side = "BOTH"
 
+        # ── 청산 전 미체결 주문 정리 (주문 누적 방지) ──────────────────────────
+        try:
+            self._client.cancel_all_orders(symbol, side=side)
+        except Exception as e:
+            log.warning("pre-exit cancel_all_orders failed for %s %s: %s", symbol, side, e)
+
         managed = ManagedOrder(
             client_id=client_id,
             symbol=symbol,
@@ -204,12 +222,119 @@ class OrderManager:
         log.warning("Close order failed for %s %s reason=%s", symbol, side, reason)
         return None
 
+    # ── Stale Order Management ────────────────────────────────────────────────
+
+    def cancel_stale_orders(self, symbol: str) -> None:
+        """
+        포지션 청산 후 거래소에 남아있는 SL/TP 및 미체결 진입 주문을 모두 취소.
+
+        호출 시점:
+          - _execute_exit (전체 청산 후)
+          - _emergency_close_all (긴급 청산 후)
+
+        주의: dry-run 모드에서는 실제 API 호출 없음.
+        """
+        if self._s.is_dry_run():
+            return
+
+        try:
+            result = self._client.cancel_all_open_orders(symbol)
+            log.info(
+                "Stale order cleanup: cancelled all open orders for %s | result=%s",
+                symbol, result,
+            )
+        except Exception as e:
+            log.warning("cancel_stale_orders: failed for %s: %s", symbol, e)
+
+        # 내부 추적 상태 정리 (해당 심볼의 주문 ID 제거)
+        stale_ids = [cid for cid, o in self._orders.items() if o.symbol == symbol]
+        for cid in stale_ids:
+            self._sent_ids.discard(cid)
+            del self._orders[cid]
+
+        if stale_ids:
+            log.debug("Removed %d tracked order(s) for %s from internal state", len(stale_ids), symbol)
+
+    def audit_stale_orders(self, active_symbols: set) -> None:
+        """
+        주기적 미체결 주문 감사 (스케줄러에서 주기적으로 호출).
+
+        로직:
+          1. 거래소에서 전체 미체결 주문 목록 조회
+          2. 활성 포지션이 없는 심볼의 SL/TP 주문 → 즉시 취소 (잔여 SL/TP)
+          3. 활성 포지션이 없는 심볼의 LIMIT 주문 중 STALE_ORDER_TIMEOUT_SECONDS 초과 → 취소
+          (포지션이 있는 심볼의 주문은 보호를 위해 유지)
+
+        active_symbols: 현재 오픈 포지션이 있는 심볼 집합 (e.g. {"BTCUSDT", "ETHUSDT"})
+        """
+        if self._s.is_dry_run():
+            return
+
+        try:
+            all_open = self._client.get_open_orders()
+        except Exception as e:
+            log.warning("audit_stale_orders: failed to fetch open orders: %s", e)
+            return
+
+        if not all_open:
+            return
+
+        now_ms = time.time() * 1000
+        cancelled_count = 0
+        for order in all_open:
+            symbol = order.get("symbol", "")
+            order_id = str(order.get("orderId", ""))
+            order_type = order.get("type", "")
+            created_ms = int(order.get("time", 0))
+            age_s = (now_ms - created_ms) / 1000 if created_ms else 0
+
+            # SL/TP 타입 주문: 포지션이 없으면 즉시 취소
+            is_sl_tp_type = order_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT")
+            no_position = symbol not in active_symbols
+
+            # 취소 조건:
+            # (a) SL/TP 주문이고 포지션이 없는 경우 → 잔여 SL/TP
+            # (b) 지정가 진입 주문이 STALE_ORDER_TIMEOUT_SECONDS 초과 → 포지션 무관
+            should_cancel = (
+                (is_sl_tp_type and no_position) or
+                (age_s > self._s.STALE_ORDER_TIMEOUT_SECONDS and
+                 order_type in ("LIMIT",) and no_position)
+            )
+
+            if not should_cancel:
+                if age_s > self._s.STALE_ORDER_TIMEOUT_SECONDS:
+                    log.debug(
+                        "audit: order %s (%s) for %s is %.0fs old — still has active position, keeping",
+                        order_id, order_type, symbol, age_s,
+                    )
+                continue
+
+            try:
+                self._client.cancel_order(symbol, order_id)
+                cancelled_count += 1
+                log.info(
+                    "audit: cancelled stale %s order %s for %s (age=%.0fs, active_pos=%s)",
+                    order_type, order_id, symbol, age_s, symbol in active_symbols,
+                )
+            except Exception as e:
+                log.warning(
+                    "audit: failed to cancel order %s for %s: %s", order_id, symbol, e
+                )
+
+        if cancelled_count > 0:
+            log.info("audit_stale_orders: cancelled %d stale order(s)", cancelled_count)
+            self._slack.send_risk_alert(
+                f"⚠️ 미체결 주문 정리: {cancelled_count}개 취소 완료"
+            )
+
     # ── Internal placers ──────────────────────────────────────────────────────
 
     def _place_market(
         self, managed: ManagedOrder, current_price: float, symbol_info: dict,
         is_close: bool = False,
     ) -> bool:
+        # 시장가로 실제 체결됨을 기록 (GTX 거부 후 폴백 포함) — 수수료 계산에 사용
+        managed.order_type = "MARKET"
         if self._s.is_dry_run():
             managed.status = OrderStatus.FILLED
             managed.avg_price = current_price
@@ -334,6 +459,10 @@ class OrderManager:
                     pass
 
             if attempt == max_retries:
+                log.info(
+                    "All %d limit attempts exhausted for %s — falling back to market",
+                    max_retries, managed.symbol,
+                )
                 return self._place_market(managed, current_price, symbol_info, is_close=is_close)
 
         return False
@@ -377,7 +506,10 @@ class OrderManager:
 
         Order type policy:
           SL → STOP_MARKET: 즉각 실행 (Taker fee)
-          TP → TAKE_PROFIT (Limit at TP2): Maker fee + 봇 TP1 로직과 충돌 방지
+          TP → TAKE_PROFIT_MARKET: closePosition=true 지원, 봇 TP1 로직과 충돌 방지
+
+        체결된 SL/TP 주문 ID를 managed.sl_order_id / managed.tp_order_id에 저장 (로깅/추적용).
+        포지션 청산 시 cancel_stale_orders()가 cancel_all_open_orders()로 일괄 정리함.
         """
         if self._s.is_dry_run():
             return
@@ -391,18 +523,27 @@ class OrderManager:
         tp_price = self._client.round_price(tp2, symbol_info) if tp2 > 0 else None
 
         try:
-            self._client.set_trading_stop(
+            result = self._client.set_trading_stop(
                 symbol=managed.symbol,
                 stop_loss=sl_price,
                 take_profit=tp_price,
                 position_side=managed.position_side,
                 sl_order_type="STOP_MARKET",
-                tp_order_type="TAKE_PROFIT",
+                tp_order_type="TAKE_PROFIT_MARKET",
                 tp_limit_price=tp_price,
             )
+            # SL/TP 주문 ID 추적 (취소 시 사용)
+            sl_result = result.get("sl", {})
+            tp_result = result.get("tp", {})
+            if sl_result:
+                managed.sl_order_id = str(sl_result.get("orderId", ""))
+            if tp_result:
+                managed.tp_order_id = str(tp_result.get("orderId", ""))
             log.info(
-                "Exchange SL/TP set | %s positionSide=%s sl=%s(STOP_MARKET) tp=%s(TAKE_PROFIT@TP2)",
+                "Exchange SL/TP set | %s positionSide=%s sl=%s(STOP_MARKET) tp=%s(TAKE_PROFIT@TP2) "
+                "sl_id=%s tp_id=%s",
                 managed.symbol, managed.position_side, sl_price, tp_price,
+                managed.sl_order_id, managed.tp_order_id,
             )
         except Exception as e:
             log.error("Failed to set exchange SL/TP for %s: %s", managed.symbol, e)

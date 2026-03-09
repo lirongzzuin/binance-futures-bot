@@ -25,6 +25,7 @@ import pandas as pd
 
 from src.config import Settings
 from src.strategy.indicators import (
+    adx,
     atr,
     bollinger_bands,
     cmf,
@@ -92,6 +93,7 @@ class SignalGenerator:
         vwap: float = 0.0,
         vwap_distance_pct: float = 0.0,
         orderbook_imbalance: float = 0.0,
+        htf_df: Optional[pd.DataFrame] = None,  # 일봉 데이터 (HTF 추세 필터)
     ) -> SignalBundle:
         bundle = SignalBundle()
 
@@ -154,6 +156,11 @@ class SignalGenerator:
 
         # ── Category 15: Squeeze Momentum ─────────────────────────────────────
         bundle.signals += self._squeeze_signal(close, high, low)
+
+        # ── Category 16: HTF Trend Filter (일봉 추세 방향) ────────────────────
+        # 가장 중요한 필터 — 일봉 추세 반대 방향 진입 차단
+        if htf_df is not None and len(htf_df) >= 50:
+            bundle.signals += self._htf_trend_signals(htf_df)
 
         return bundle
 
@@ -905,6 +912,138 @@ class SignalGenerator:
                 ))
         except Exception:
             pass
+        return signals
+
+    # ── HTF Trend Filter (일봉 기반 추세 방향) ────────────────────────────────
+
+    def _htf_trend_signals(self, htf_df: pd.DataFrame) -> list:
+        """
+        일봉 기반 추세 방향 신호 — 가장 높은 가중치 카테고리.
+
+        규칙:
+        - EMA9 > EMA21 > EMA50 > EMA200 (완전 정렬) → 강한 상승 추세
+        - EMA50 > EMA200 (골든크로스 구간) → 불마켓 (long bias)
+        - EMA50 < EMA200 (데스크로스 구간) → 베어마켓 (short bias)
+        - RSI가 40-70 구간에서 롱, 30-60 구간에서 숏 진입 선호
+
+        이 필터가 발동되면 역방향 신호는 combiner에서 대부분 차단됨.
+        """
+        signals = []
+        try:
+            close = htf_df["close"]
+            high = htf_df["high"]
+            low = htf_df["low"]
+
+            # EMA200 기준: 215봉 이상 필요 (EMA 수렴용 워밍업 포함)
+            min_htf_bars = self._s.HTF_EMA_TREND + 15
+            if len(close) < min_htf_bars:
+                return signals
+
+            # ── HTF EMA 계산 ──────────────────────────────────────────────────
+            ef = ema(close, self._s.HTF_EMA_FAST)
+            em = ema(close, self._s.HTF_EMA_MID)
+            es = ema(close, self._s.HTF_EMA_SLOW)
+            et = ema(close, self._s.HTF_EMA_TREND)
+
+            ef_now = float(ef.iloc[-1])
+            em_now = float(em.iloc[-1])
+            es_now = float(es.iloc[-1])
+            et_now = float(et.iloc[-1])
+            price_now = float(close.iloc[-1])
+
+            # ── EMA 정렬 점수 ─────────────────────────────────────────────────
+            # full_bull: 모든 EMA 완전 정렬 (가장 강한 추세)
+            full_bull = ef_now > em_now > es_now > et_now and price_now > ef_now
+            # mild_bull: EMA50 > EMA200 = 불마켓
+            mild_bull = es_now > et_now
+            full_bear = ef_now < em_now < es_now < et_now and price_now < ef_now
+            mild_bear = es_now < et_now  # EMA50 < EMA200 = 베어마켓
+
+            # ── HTF ADX ───────────────────────────────────────────────────────
+            adx_df_htf = adx(high, low, close, self._s.ADX_PERIOD)
+            htf_adx = float(adx_df_htf["adx"].iloc[-1])
+            htf_plus_di = float(adx_df_htf["plus_di"].iloc[-1])
+            htf_minus_di = float(adx_df_htf["minus_di"].iloc[-1])
+            adx_trending = htf_adx >= self._s.HTF_ADX_THRESHOLD
+            adx_bullish = htf_plus_di > htf_minus_di
+
+            # ── HTF RSI ───────────────────────────────────────────────────────
+            rsi_s = rsi(close, self._s.RSI_PERIOD)
+            htf_rsi = float(rsi_s.iloc[-1]) if not pd.isna(rsi_s.iloc[-1]) else 50.0
+
+            # ── HTF 방향 결정 ─────────────────────────────────────────────────
+            if full_bull and adx_trending:
+                conf = min(1.0, 0.85 + min(0.15, (htf_adx - 20) / 100))
+                signals.append(Signal(
+                    name="htf_strong_bull",
+                    direction=1,
+                    confidence=conf,
+                    category="htf_trend",
+                ))
+            elif mild_bull:
+                if adx_trending and adx_bullish:
+                    conf = 0.80
+                elif adx_bullish:
+                    conf = 0.65
+                else:
+                    conf = 0.55  # 조정 중이지만 불마켓 유지
+                signals.append(Signal(
+                    name="htf_mild_bull",
+                    direction=1,
+                    confidence=conf,
+                    category="htf_trend",
+                ))
+            elif full_bear and adx_trending:
+                conf = min(1.0, 0.85 + min(0.15, (htf_adx - 20) / 100))
+                signals.append(Signal(
+                    name="htf_strong_bear",
+                    direction=-1,
+                    confidence=conf,
+                    category="htf_trend",
+                ))
+            elif mild_bear:
+                if adx_trending and not adx_bullish:
+                    conf = 0.80
+                elif not adx_bullish:
+                    conf = 0.65
+                else:
+                    conf = 0.55
+                signals.append(Signal(
+                    name="htf_mild_bear",
+                    direction=-1,
+                    confidence=conf,
+                    category="htf_trend",
+                ))
+            else:
+                signals.append(Signal(
+                    name="htf_neutral",
+                    direction=0,
+                    confidence=0.15,
+                    category="htf_trend",
+                ))
+
+            # ── RSI 진입 품질 보조 신호 (동일 방향만) ────────────────────────
+            rsi_ok_for_long = self._s.HTF_RSI_BULL_MIN <= htf_rsi <= self._s.HTF_RSI_BULL_MAX
+            rsi_ok_for_short = self._s.HTF_RSI_BEAR_MIN <= htf_rsi <= self._s.HTF_RSI_BEAR_MAX
+
+            if rsi_ok_for_long and mild_bull:
+                signals.append(Signal(
+                    name="htf_rsi_bull_zone",
+                    direction=1,
+                    confidence=0.65,
+                    category="htf_trend",
+                ))
+            elif rsi_ok_for_short and mild_bear:
+                signals.append(Signal(
+                    name="htf_rsi_bear_zone",
+                    direction=-1,
+                    confidence=0.65,
+                    category="htf_trend",
+                ))
+
+        except Exception:
+            pass
+
         return signals
 
     # ── ICT Signals ───────────────────────────────────────────────────────────

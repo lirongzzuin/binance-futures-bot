@@ -1,0 +1,38 @@
+# ── 민감 정보 (절대 커밋 금지) ──────────────────
+.env
+*.env
+.env.local
+.env.production
+
+# ── 데이터베이스 ────────────────────────────────
+*.db
+*.db-wal
+*.db-shm
+
+# ── 로그 ────────────────────────────────────────
+logs/
+*.log
+
+# ── Python ──────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# ── 가상환경 ────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── IDE ─────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
