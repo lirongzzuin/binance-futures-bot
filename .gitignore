@@ -36,3 +36,12 @@ env/
 *.swp
 *.swo
 .DS_Store
+
+# ── 기타 ────────────────────────────────────────
+.env.*
+!.env.example
+*.pem
+*.key
+reports/
+data_cache/
+.claude/settings.local.json
